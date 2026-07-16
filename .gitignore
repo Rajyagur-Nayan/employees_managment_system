@@ -1,0 +1,34 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+env/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Face data (biometric/personal — never commit real face images or embeddings)
+data/known_faces/
+data/embeddings/
+data/embeddings.npy
+*.jpg
+*.jpeg
+*.png
+!docs/*.png
+!docs/*.jpg
+
+# Pretrained model weights (large binaries — download separately, see README)
+models/*.pt
+
+# Streamlit local cache
+.streamlit/secrets.toml

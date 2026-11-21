@@ -9,10 +9,24 @@ class PersonBase(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     department: Optional[str] = "General"
+    shift_name: Optional[str] = "General Shift"
+    shift_timing: Optional[str] = "09:00 - 18:00"
+    assigned_workstation_id: Optional[int] = None
 
 
 class PersonCreate(PersonBase):
     pass
+
+
+class PersonUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    department: Optional[str] = None
+    shift_name: Optional[str] = None
+    shift_timing: Optional[str] = None
+    assigned_workstation_id: Optional[int] = None
+    is_active: Optional[bool] = None
 
 
 class Person(PersonBase):

@@ -1,4 +1,9 @@
-export const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws/attendance";
+const resolveWsUrl = (): string => {
+  const envWs = process.env.NEXT_PUBLIC_WS_URL || "ws://127.0.0.1:8000/ws/attendance";
+  return envWs.replace("://localhost:", "://127.0.0.1:");
+};
+
+export const WS_URL = resolveWsUrl();
 
 export class WebSocketClient {
   private ws: WebSocket | null = null;
@@ -70,8 +75,8 @@ export class WebSocketClient {
     }
 
     this.reconnectAttempts++;
-    // Exponential backoff capped at 5 seconds
-    const delay = Math.min(5000, 1000 * Math.pow(1.5, Math.min(this.reconnectAttempts, 5)));
+    // Exponential backoff starting at 3s and capped at 15s to eliminate 1s rapid loop
+    const delay = Math.min(15000, 3000 * Math.pow(1.5, Math.min(this.reconnectAttempts, 4)));
 
     this.reconnectTimer = setTimeout(() => {
       this.connect();

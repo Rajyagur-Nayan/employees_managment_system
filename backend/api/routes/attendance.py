@@ -15,6 +15,7 @@ class ManualAttendanceRequest(BaseModel):
     employee_id: str
     operator: str = "supervisor"
     notes: Optional[str] = "Manual entry due to camera / recognition issue"
+    date: Optional[str] = None
 
 
 @router.get("", response_model=List[AttendanceLog])
@@ -43,6 +44,7 @@ def manual_check_in(
             employee_id=request.employee_id,
             operator=request.operator,
             notes=request.notes,
+            date_str=request.date,
         )
         return record
     except ValueError as e:

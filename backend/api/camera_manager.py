@@ -6,12 +6,16 @@ import logging
 from typing import List, Optional, Dict, Any
 import cv2
 import numpy as np
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 
 from core.config import (
     CAMERA_SOURCE,
     WORKSTATION_CAMERA_SOURCE,
     PROJECT_ROOT,
+    CAMERA_WIDTH,
+    CAMERA_HEIGHT,
+    CAMERA_TARGET_FPS,
+    CAMERA_JPEG_QUALITY,
 )
 from core.enrollment import EnrollmentManager
 from core.attendance_engine import AttendanceEngine
@@ -38,12 +42,13 @@ class SafeCameraCapture:
         self.latest_jpeg: Optional[bytes] = None
         self.lock = threading.Lock()
         self.thread: Optional[threading.Thread] = None
+        self.target_delay = 1.0 / max(1, CAMERA_TARGET_FPS)
 
     def start(self):
         if self.is_running:
             return
         self.is_running = True
-        self.thread = threading.Thread(target=self._capture_worker, daemon=True)
+        self.thread = threading.Thread(target=self._capture_worker, daemon=True, name=f"CamWorker-{self.source}")
         self.thread.start()
 
     def stop(self):
@@ -71,6 +76,7 @@ class SafeCameraCapture:
                 if sys.platform.startswith("win"):
                     self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
                     if self.cap.isOpened():
+                        self._configure_capture()
                         self.is_connected = True
                         return True
             except Exception:
@@ -80,10 +86,25 @@ class SafeCameraCapture:
             self.cap = cv2.VideoCapture(src)
 
         if self.cap and self.cap.isOpened():
+            self._configure_capture()
             self.is_connected = True
             return True
         self.is_connected = False
         return False
+
+    def _configure_capture(self):
+        """Sets optimal resolution, fourcc, and frame buffer to reduce CPU consumption."""
+        if not self.cap:
+            return
+        try:
+            # MJPG hardware decoding prevents frame delay on Windows/DirectShow
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            self.cap.set(cv2.CAP_PROP_FPS, CAMERA_TARGET_FPS)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
 
     def _capture_worker(self):
         if not self._open_camera():
@@ -111,11 +132,45 @@ class SafeCameraCapture:
             with self.lock:
                 self.latest_frame = frame
 
-            time.sleep(0.03)  # ~30 FPS
+            time.sleep(self.target_delay)
 
     def read_frame(self) -> Optional[np.ndarray]:
         with self.lock:
             return self.latest_frame.copy() if self.latest_frame is not None else None
+
+
+class CameraHub:
+    """
+    Unified camera capture registry.
+    Ensures that multiple consumers for the same physical camera device (e.g. source 0)
+    share a single SafeCameraCapture thread without device locks or duplicate frames.
+    """
+    _captures: Dict[Any, SafeCameraCapture] = {}
+    _ref_counts: Dict[Any, int] = {}
+    _lock = threading.Lock()
+
+    @classmethod
+    def acquire(cls, source: Any) -> SafeCameraCapture:
+        with cls._lock:
+            if source not in cls._captures or not cls._captures[source].is_running:
+                cap = SafeCameraCapture(source)
+                cap.start()
+                cls._captures[source] = cap
+                cls._ref_counts[source] = 1
+            else:
+                cls._ref_counts[source] = cls._ref_counts.get(source, 0) + 1
+            return cls._captures[source]
+
+    @classmethod
+    def release(cls, source: Any):
+        with cls._lock:
+            if source in cls._ref_counts:
+                cls._ref_counts[source] -= 1
+                if cls._ref_counts[source] <= 0:
+                    cap = cls._captures.pop(source, None)
+                    cls._ref_counts.pop(source, None)
+                    if cap:
+                        cap.stop()
 
 
 class AttendanceCameraManager:
@@ -136,11 +191,14 @@ class AttendanceCameraManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_websockets.append(websocket)
-        await self.send_message({
-            "type": "system",
-            "status": "running" if self.is_running else "stopped",
-            "camera_connected": self.capture.is_connected if self.capture else False,
-        })
+        try:
+            await self.send_message({
+                "type": "system",
+                "status": "running" if self.is_running else "stopped",
+                "camera_connected": self.capture.is_connected if self.capture else False,
+            })
+        except Exception:
+            self.disconnect(websocket)
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_websockets:
@@ -148,7 +206,7 @@ class AttendanceCameraManager:
 
     async def send_message(self, message: dict):
         dead_sockets = []
-        for ws in self.active_websockets:
+        for ws in list(self.active_websockets):
             try:
                 await ws.send_text(json.dumps(message))
             except Exception:
@@ -162,15 +220,14 @@ class AttendanceCameraManager:
         self.is_running = True
         self.started_at = time.time()
         self.has_streamed_frame = False
-        self.capture = SafeCameraCapture(self.camera_source)
-        self.capture.start()
-        logger.info(f"[AttendanceCamera] Started laptop camera on source {self.camera_source}")
+        self.capture = CameraHub.acquire(self.camera_source)
+        logger.info(f"[AttendanceCamera] Acquired camera on source {self.camera_source} via CameraHub")
 
     def stop(self):
         self.is_running = False
         self.has_streamed_frame = False
         if self.capture:
-            self.capture.stop()
+            CameraHub.release(self.camera_source)
             self.capture = None
         with self.lock:
             self.annotated_jpeg = None
@@ -178,54 +235,71 @@ class AttendanceCameraManager:
 
     async def process_loop(self):
         """Main async pipeline loop."""
-        while True:
-            if not self.is_running or not self.capture:
-                await asyncio.sleep(0.3)
-                continue
+        try:
+            while True:
+                if not self.is_running or not self.capture:
+                    await asyncio.sleep(0.3)
+                    continue
 
-            frame = self.capture.read_frame()
-            if frame is None:
-                # Allow a 5-second grace window for camera hardware to initialize
-                # without emitting false disconnect errors
-                elapsed = time.time() - self.started_at
-                if elapsed > 5.0 and not self.capture.is_connected:
+                frame = self.capture.read_frame()
+                if frame is None:
+                    # Allow a 5-second grace window for camera hardware to initialize
+                    # without emitting false disconnect errors
+                    elapsed = time.time() - self.started_at
+                    if elapsed > 5.0 and not self.capture.is_connected:
+                        await self.send_message({
+                            "type": "system",
+                            "status": "error",
+                            "message": "Laptop camera disconnected or unavailable. Please ensure camera access is allowed.",
+                        })
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # First frame received after starting
+                if not self.has_streamed_frame:
+                    self.has_streamed_frame = True
                     await self.send_message({
                         "type": "system",
-                        "status": "error",
-                        "message": "Laptop camera disconnected or unavailable. Please ensure camera access is allowed.",
+                        "status": "running",
+                        "camera_connected": True,
                     })
-                await asyncio.sleep(0.1)
-                continue
 
-            # First frame received after starting
-            if not self.has_streamed_frame:
-                self.has_streamed_frame = True
-                await self.send_message({
-                    "type": "system",
-                    "status": "running",
-                    "camera_connected": True,
-                })
+                try:
+                    # AttendanceEngine processes frame with intermittent YOLO and asynchronous DB logging
+                    events, annotated, debug_info = self.engine.process_frame(frame, None)
+                    
+                    # Update annotated JPEG frame for video stream
+                    ret, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, CAMERA_JPEG_QUALITY])
+                    if ret:
+                        with self.lock:
+                            self.annotated_jpeg = jpeg.tobytes()
 
-            db = SessionLocal()
-            try:
-                events, annotated, debug_info = self.engine.process_frame(frame, db)
-                
-                # Update annotated JPEG frame for video stream
-                ret, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ret:
-                    with self.lock:
-                        self.annotated_jpeg = jpeg.tobytes()
+                    # Broadcast events
+                    attendance_marked = False
+                    for ev in events:
+                        await self.send_message(ev)
+                        if ev.get("type") == "attendance":
+                            attendance_marked = True
 
-                # Broadcast events
-                for ev in events:
-                    await self.send_message(ev)
+                    if attendance_marked:
+                        logger.info("[AttendanceCamera] Attendance processed. Auto-stopping camera.")
+                        # Allow a brief moment (1s) so the client receives the green annotated bounding box
+                        await asyncio.sleep(1.0)
+                        await self.send_message({
+                            "type": "system",
+                            "status": "stopped",
+                            "message": "Attendance marked successfully. Camera closed automatically.",
+                        })
+                        self.stop()
 
-            except Exception as e:
-                logger.error(f"[AttendanceCamera] Process error: {e}")
-            finally:
-                db.close()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"[AttendanceCamera] Process error: {e}")
 
-            await asyncio.sleep(0.04)  # ~25 FPS
+                await asyncio.sleep(0.01)  # Smooth 30 FPS capability without main-thread blocking
+        except asyncio.CancelledError:
+            logger.info("[AttendanceCamera] Process loop stopped gracefully.")
 
     def get_frame(self) -> Optional[bytes]:
         with self.lock:
@@ -239,12 +313,20 @@ class WorkstationCameraManager:
         self.camera_source = WORKSTATION_CAMERA_SOURCE
         self.capture: Optional[SafeCameraCapture] = None
         self.engine = WorkstationPresenceEngine(enrollment_manager)
+        self.engine.workstation_id = 1
+        self.engine.is_monitoring = True
         self.active_websockets: List[WebSocket] = []
         self.annotated_jpeg: Optional[bytes] = None
         self.is_running = False
         self.started_at: float = 0.0
         self.lock = threading.Lock()
         self.latest_telemetry: Dict[str, Any] = {}
+        self.pending_alert_messages: List[Dict[str, Any]] = []
+        self.engine.on_alert_callback = self._on_alert_generated
+
+    def _on_alert_generated(self, alert_msg: Dict[str, Any]):
+        with self.lock:
+            self.pending_alert_messages.append(alert_msg)
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -253,8 +335,13 @@ class WorkstationCameraManager:
         try:
             status = self.engine.get_status_telemetry(db)
             await websocket.send_text(json.dumps({"type": "telemetry", **status}))
+        except (WebSocketDisconnect, Exception):
+            self.disconnect(websocket)
         finally:
-            db.close()
+            try:
+                db.close()
+            except Exception:
+                pass
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_websockets:
@@ -262,7 +349,7 @@ class WorkstationCameraManager:
 
     async def send_message(self, message: dict):
         dead_sockets = []
-        for ws in self.active_websockets:
+        for ws in list(self.active_websockets):
             try:
                 await ws.send_text(json.dumps(message))
             except Exception:
@@ -275,32 +362,47 @@ class WorkstationCameraManager:
             return
         self.is_running = True
         self.started_at = time.time()
-        self.capture = SafeCameraCapture(self.camera_source)
-        self.capture.start()
-        logger.info(f"[WorkstationCamera] Started on source {self.camera_source}")
+        self.capture = CameraHub.acquire(self.camera_source)
+        self.engine.is_monitoring = True
+        if self.engine.status == "STOPPED":
+            self.engine.status = "WAITING"
+        logger.info(f"[WorkstationCamera] Acquired source {self.camera_source} via CameraHub")
 
     def stop_camera(self):
         self.is_running = False
         if self.capture:
-            self.capture.stop()
+            CameraHub.release(self.camera_source)
             self.capture = None
         with self.lock:
             self.annotated_jpeg = None
+        db = SessionLocal()
+        try:
+            self.engine.stop_monitoring(db, "supervisor")
+        except Exception as e:
+            logger.error(f"[WorkstationCamera] Error stopping engine: {e}")
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
         logger.info("[WorkstationCamera] Stopped.")
 
     async def process_loop(self):
-        while True:
-            if not self.is_running or not self.capture:
-                await asyncio.sleep(0.3)
-                continue
+        try:
+            while True:
+                if not self.is_running or not self.capture:
+                    await asyncio.sleep(0.3)
+                    continue
 
-            frame = self.capture.read_frame()
-            db = SessionLocal()
-            try:
+                frame = self.capture.read_frame()
                 if frame is None:
                     elapsed = time.time() - self.started_at
                     if elapsed > 5.0 and not self.capture.is_connected:
-                        self.engine.handle_camera_disconnection(db, "Camera disconnected")
+                        db = SessionLocal()
+                        try:
+                            self.engine.handle_camera_disconnection(db, "Camera disconnected")
+                        finally:
+                            db.close()
                         await self.send_message({
                             "type": "camera_error",
                             "message": "Workstation camera disconnected",
@@ -308,27 +410,37 @@ class WorkstationCameraManager:
                     await asyncio.sleep(0.1)
                     continue
 
-                annotated, telemetry = self.engine.process_workstation_frame(frame, db)
-                self.latest_telemetry = telemetry
+                try:
+                    annotated, telemetry = self.engine.process_workstation_frame(frame, None)
+                    self.latest_telemetry = telemetry
 
-                # Encode frame
-                ret, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ret:
+                    # Encode frame
+                    ret, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, CAMERA_JPEG_QUALITY])
+                    if ret:
+                        with self.lock:
+                            self.annotated_jpeg = jpeg.tobytes()
+
+                    # Broadcast telemetry to connected clients
+                    await self.send_message({
+                        "type": "telemetry",
+                        **telemetry,
+                    })
+
+                    # Broadcast any real-time position absence alerts
                     with self.lock:
-                        self.annotated_jpeg = jpeg.tobytes()
+                        pending_alerts = list(self.pending_alert_messages)
+                        self.pending_alert_messages.clear()
+                    for p_msg in pending_alerts:
+                        await self.send_message(p_msg)
 
-                # Broadcast telemetry to connected clients
-                await self.send_message({
-                    "type": "telemetry",
-                    **telemetry,
-                })
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"[WorkstationCamera] Process error: {e}")
 
-            except Exception as e:
-                logger.error(f"[WorkstationCamera] Process error: {e}")
-            finally:
-                db.close()
-
-            await asyncio.sleep(0.08)  # ~12 FPS for presence tracking (efficient CPU use)
+                await asyncio.sleep(0.02)  # High performance responsive loop
+        except asyncio.CancelledError:
+            logger.info("[WorkstationCamera] Process loop stopped gracefully.")
 
     def get_frame(self) -> Optional[bytes]:
         with self.lock:

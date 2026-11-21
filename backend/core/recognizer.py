@@ -73,11 +73,17 @@ class FaceRecognizer:
                 return None
             if face_crop.shape[0] < 20 or face_crop.shape[1] < 20:
                 return None
-            img = Image.fromarray(face_crop[:, :, ::-1])
-            face = self.mtcnn(img)
-            if face is None:
-                return None
-            return self.model(face.unsqueeze(0).to(self.device)).detach().cpu().numpy()[0]
+            rgb_arr = face_crop[:, :, ::-1]
+            pil_img = Image.fromarray(rgb_arr)
+            face_tensor = self.mtcnn(pil_img)
+            if face_tensor is None:
+                import cv2
+                resized = cv2.resize(rgb_arr, (160, 160))
+                tensor = torch.from_numpy(resized.transpose((2, 0, 1))).float()
+                face_tensor = (tensor - 127.5) / 128.0
+            face_tensor = face_tensor.unsqueeze(0).to(self.device)
+            with torch.inference_mode():
+                return self.model(face_tensor).cpu().numpy()[0]
         except Exception:
             return None
 

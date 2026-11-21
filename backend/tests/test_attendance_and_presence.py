@@ -174,7 +174,7 @@ class TestEmployeeAttendanceAndWorkstationPresence(unittest.TestCase):
         clock = ControllableClock(1000.0)
         engine = WorkstationPresenceEngine(clock_fn=clock)
         engine.min_confirmation_frames = 1
-        engine.start_monitoring(self.db, self.workstation.id, "EMP001")
+        engine.start_monitoring(self.db, self.workstation.id, "EMP001", validate_attendance=False)
 
         self.assertEqual(engine.status, "PAUSED")
 
@@ -194,7 +194,7 @@ class TestEmployeeAttendanceAndWorkstationPresence(unittest.TestCase):
         clock = ControllableClock(1000.0)
         engine = WorkstationPresenceEngine(clock_fn=clock)
         engine.min_confirmation_frames = 1
-        engine.start_monitoring(self.db, self.workstation.id, "EMP001")
+        engine.start_monitoring(self.db, self.workstation.id, "EMP001", validate_attendance=False)
 
         # 1. Establish presence
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -234,7 +234,7 @@ class TestEmployeeAttendanceAndWorkstationPresence(unittest.TestCase):
         clock = ControllableClock(1000.0)
         engine = WorkstationPresenceEngine(clock_fn=clock)
         engine.min_confirmation_frames = 1
-        engine.start_monitoring(self.db, self.workstation.id, "EMP001")
+        engine.start_monitoring(self.db, self.workstation.id, "EMP001", validate_attendance=False)
 
         # Present
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -337,6 +337,23 @@ class TestEmployeeAttendanceAndWorkstationPresence(unittest.TestCase):
 
         self.db.refresh(session)
         self.assertEqual(session.status, "STOPPED")
+
+    def test_delete_employee_completely(self):
+        """Deleting an employee completely removes them and their referencing records from the database."""
+        from db.crud import delete_employee_completely
+        emp = upsert_person(self.db, "EMP_DEL_TEST", "Test Employee", shift_name="General Shift")
+        log_attendance(self.db, emp, confidence=0.95)
+
+        # Confirm employee exists
+        self.assertIsNotNone(self.db.query(Person).filter(Person.employee_id == "EMP_DEL_TEST").first())
+        self.assertGreaterEqual(self.db.query(AttendanceLog).filter(AttendanceLog.employee_id == "EMP_DEL_TEST").count(), 1)
+
+        # Perform complete deletion
+        delete_employee_completely(self.db, emp)
+
+        # Confirm employee and logs are deleted
+        self.assertIsNone(self.db.query(Person).filter(Person.employee_id == "EMP_DEL_TEST").first())
+        self.assertEqual(self.db.query(AttendanceLog).filter(AttendanceLog.employee_id == "EMP_DEL_TEST").count(), 0)
 
 
 if __name__ == "__main__":

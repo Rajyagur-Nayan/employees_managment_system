@@ -31,12 +31,14 @@ def get_attendance_status():
 
 
 def generate_attendance_frames():
-    while True:
+    last_frame = None
+    while attendance_manager.is_running:
         frame = attendance_manager.get_frame()
-        if frame is not None:
+        if frame is not None and frame is not last_frame:
+            last_frame = frame
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.04)
+        time.sleep(0.02)
 
 
 @router.get("/stream")
@@ -71,12 +73,14 @@ def get_workstation_camera_status():
 
 
 def generate_workstation_frames():
-    while True:
+    last_frame = None
+    while workstation_manager.is_running:
         frame = workstation_manager.get_frame()
-        if frame is not None:
+        if frame is not None and frame is not last_frame:
+            last_frame = frame
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.08)
+        time.sleep(0.02)
 
 
 @router.get("/workstation/stream")

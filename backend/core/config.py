@@ -4,6 +4,29 @@ from dotenv import load_dotenv
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
+# Ensure Ultralytics config is stored inside the workspace to prevent AppData permission errors
+YOLO_CONFIG_DIR = os.path.join(PROJECT_ROOT, "backend", ".ultralytics")
+os.makedirs(YOLO_CONFIG_DIR, exist_ok=True)
+os.environ["YOLO_CONFIG_DIR"] = YOLO_CONFIG_DIR
+
+# =========================
+# CPU & Threading Optimization
+# =========================
+TORCH_NUM_THREADS = int(os.getenv("TORCH_NUM_THREADS", "4"))
+OPENCV_NUM_THREADS = int(os.getenv("OPENCV_NUM_THREADS", "2"))
+
+try:
+    import torch
+    torch.set_num_threads(TORCH_NUM_THREADS)
+except Exception:
+    pass
+
+try:
+    import cv2
+    cv2.setNumThreads(OPENCV_NUM_THREADS)
+except Exception:
+    pass
+
 # =========================
 # Camera
 # =========================
@@ -13,29 +36,40 @@ try:
     CAMERA_SOURCE = int(CAMERA_SOURCE)
 except ValueError:
     pass
+
+CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "640"))
+CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
+CAMERA_TARGET_FPS = int(os.getenv("CAMERA_TARGET_FPS", "30"))
+CAMERA_JPEG_QUALITY = int(os.getenv("CAMERA_JPEG_QUALITY", "70"))
+
 # =========================
 # YOLO Face Detection
 # =========================
 
 YOLO_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "yolov8n-face.pt")
+YOLO_OPENVINO_DIR = os.path.join(PROJECT_ROOT, "models", "yolov8n-face_openvino_model")
+OPENVINO_ENABLED = os.getenv("OPENVINO_ENABLED", "True").lower() in ("true", "1", "yes")
 
-YOLO_CONF_THRESHOLD = 0.5
-YOLO_IOU_THRESHOLD = 0.4
+INFERENCE_SIZE = int(os.getenv("INFERENCE_SIZE", "320"))
+DETECTION_INTERVAL = int(os.getenv("DETECTION_INTERVAL", "3"))  # Run YOLO every N frames, DeepSORT tracks between
+
+YOLO_CONF_THRESHOLD = float(os.getenv("YOLO_CONF_THRESHOLD", "0.45"))
+YOLO_IOU_THRESHOLD = float(os.getenv("YOLO_IOU_THRESHOLD", "0.45"))
 
 # Keep these if other files in your project use them
 YOLO_CONF = YOLO_CONF_THRESHOLD
 YOLO_IOU = YOLO_IOU_THRESHOLD
 
-MIN_FACE_SIZE = 30
-
+MIN_FACE_SIZE = int(os.getenv("MIN_FACE_SIZE", "30"))
 
 # =========================
-# FaceNet
+# FaceNet & Recognition Optimization
 # =========================
 
 FACENET_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "facenet.pt")
 
-EMBEDDING_SIMILARITY_THRESHOLD = 0.7
+EMBEDDING_SIMILARITY_THRESHOLD = float(os.getenv("EMBEDDING_SIMILARITY_THRESHOLD", "0.65"))
+RECOGNITION_CACHE_TTL = int(os.getenv("RECOGNITION_CACHE_TTL", "45"))  # Frames before re-checking confirmed track
 
 KNOWN_FACES_DIR = os.path.join(PROJECT_ROOT, "data", "known_faces")
 EMBEDDINGS_CACHE = os.path.join(PROJECT_ROOT, "data", "embeddings")
@@ -54,14 +88,12 @@ DEEPSORT_MAX_DIST = 0.2
 
 
 # =========================
-# Neon PostgreSQL / SQLite Local Database
+# Database URL
 # =========================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    local_sqlite_path = os.path.join(PROJECT_ROOT, "data", "attendance.db").replace("\\", "/")
-    DATABASE_URL = f"sqlite:///{local_sqlite_path}"
-    print(f"[Config] DATABASE_URL not set in .env — using local SQLite: {DATABASE_URL}")
+    raise ValueError("DATABASE_URL is not set in .env file.")
 
 # =========================
 # Attendance & Multi-Frame Confirmation
@@ -69,7 +101,7 @@ if not DATABASE_URL:
 
 DUPLICATE_WINDOW_SECONDS = int(os.getenv("DUPLICATE_WINDOW_SECONDS", "60"))
 ATTENDANCE_CONFIRMATION_FRAMES = int(os.getenv("ATTENDANCE_CONFIRMATION_FRAMES", "3"))
-ATTENDANCE_CONFIRMATION_WINDOW_SEC = float(os.getenv("ATTENDANCE_CONFIRMATION_WINDOW_SEC", "2.0"))
+ATTENDANCE_CONFIRMATION_WINDOW_SEC = float(os.getenv("ATTENDANCE_CONFIRMATION_WINDOW_SEC", "1.5"))
 
 # =========================
 # Liveness & Anti-Spoofing
@@ -92,6 +124,13 @@ except ValueError:
 WORKSTATION_ABSENCE_GRACE_SECONDS = int(os.getenv("WORKSTATION_ABSENCE_GRACE_SECONDS", "60"))
 WORKSTATION_PRESENCE_FRAMES = int(os.getenv("WORKSTATION_PRESENCE_FRAMES", "3"))
 WORKSTATION_DETECTION_INTERVAL = float(os.getenv("WORKSTATION_DETECTION_INTERVAL", "0.2"))  # 5 FPS check
+
+# =========================
+# Employee Position Alerts (15 Minutes Continuous Absence)
+# =========================
+POSITION_ALERT_THRESHOLD_SECONDS = int(os.getenv("POSITION_ALERT_THRESHOLD_SECONDS", "900"))  # 15 minutes
+POSITION_DETECTION_GRACE_SECONDS = int(os.getenv("POSITION_DETECTION_GRACE_SECONDS", "60"))  # 30-60s camera tolerance
+POSITION_ALERT_AUTO_RESOLVE = os.getenv("POSITION_ALERT_AUTO_RESOLVE", "True").lower() in ("true", "1", "yes")
 
 # Default Workstation ROI (Normalized: x1, y1, x2, y2 from 0.0 to 1.0)
 DEFAULT_WORKSTATION_ROI = [0.0, 0.0, 1.0, 1.0]
